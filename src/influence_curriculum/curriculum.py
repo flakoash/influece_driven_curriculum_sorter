@@ -45,13 +45,13 @@ def build_curriculum(
                 if t - k >= 0:
                     scores[:, t] += Phi[:, t - k] * hk
     else:
-        scores = Phi
+        scores = Phi.view()  # view only; build_curriculum never mutates scores
 
     for e in range(T):
         col = scores[:, e]
         order = np.argsort(col)
         if config.direction == "desc":
-            order = order[::-1]
+            order = order[::-1].copy()
 
         shuffled: list[int] = []
         for start in range(0, len(order), config.segment_size):
