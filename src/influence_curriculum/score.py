@@ -38,6 +38,8 @@ def compute_influence_matrix(
     device: str,
 ) -> np.ndarray:
     D = len(encodings)
+    if D == 0:
+        raise ValueError("encodings list is empty — no documents to score")
     T = len(checkpoint_paths)
     Phi = np.zeros((D, T), dtype=np.float32)
 

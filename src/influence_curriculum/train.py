@@ -56,8 +56,6 @@ def train_surrogate(
     seed: int,
     device: str,
 ) -> list[str]:
-    torch.manual_seed(seed)
-
     # Re-initialize all weights from scratch (spec: architecture only, not weights)
     torch.manual_seed(seed)
     model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
@@ -80,7 +78,7 @@ def train_surrogate(
     )
     grad_accum = max(1, config.effective_batch_size // config.per_device_batch_size)
     steps_per_epoch = max(1, math.ceil(len(dataset) / config.per_device_batch_size))
-    total_steps = config.epochs * steps_per_epoch // grad_accum
+    total_steps = max(1, config.epochs * math.ceil(steps_per_epoch / grad_accum))
     scheduler = get_scheduler(
         config.lr_scheduler, optimizer=optimizer,
         num_warmup_steps=0, num_training_steps=total_steps,
@@ -103,7 +101,8 @@ def train_surrogate(
         for step, batch in enumerate(loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["input_ids"].clone()
-            outputs = model(**batch, labels=labels)
+            model_inputs = {k: v for k, v in batch.items() if k != "labels"}
+            outputs = model(**model_inputs, labels=labels)
             (outputs.loss / grad_accum).backward()
             if (step + 1) % grad_accum == 0:
                 optimizer.step()

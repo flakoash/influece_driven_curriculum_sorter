@@ -42,8 +42,9 @@ def build_curriculum(
         scores = np.zeros_like(Phi)
         for t in range(T):
             for k, hk in enumerate(h):
-                if t - k >= 0:
-                    scores[:, t] += Phi[:, t - k] * hk
+                lag = k + 1
+                if t - lag >= 0:
+                    scores[:, t] += Phi[:, t - lag] * hk
     else:
         scores = Phi.view()  # view only; build_curriculum never mutates scores
 

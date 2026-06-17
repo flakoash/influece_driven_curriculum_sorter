@@ -63,9 +63,11 @@ def sort_by_influence(
     if checkpoints is None:
         checkpoints = train_surrogate(model, tokenizer, texts, str(out), training_config, seed, device)
     else:
+        if len(checkpoints) == 0:
+            raise ValueError("checkpoints list is empty; T must be >= 1")
         if len(checkpoints) == 1:
             warnings.warn("T=1: per-epoch curriculum collapses to a single ordering.", stacklevel=2)
-        if len(checkpoints) != training_config.epochs:
+        elif len(checkpoints) != training_config.epochs:
             warnings.warn(
                 "Supplied checkpoint count doesn't match training_config.epochs. "
                 "If checkpoints were not produced by a random-order run on this data, "
