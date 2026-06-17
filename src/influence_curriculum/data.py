@@ -1,7 +1,7 @@
 from __future__ import annotations
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -16,7 +16,7 @@ class DataConfig:
 
 def _segment(text: str, rule: str | Callable) -> list[str]:
     if callable(rule):
-        return [s for s in rule(text) if s.strip()]
+        return [s.strip() for s in rule(text) if s.strip()]
     if rule == "line":
         return [l.strip() for l in text.splitlines() if l.strip()]
     if rule == "blank_line":
@@ -45,7 +45,7 @@ def load_documents(
                 n = len(tokenizer.encode(seg, add_special_tokens=False))
                 if n < config.min_doc_tokens:
                     continue
-            elif config.min_doc_tokens > 1 and len(seg.split()) < config.min_doc_tokens:
+            elif tokenizer is None and len(seg.split()) < config.min_doc_tokens:
                 continue
             texts.append(seg)
             doc_ids.append(f"{path.stem}#{i}")

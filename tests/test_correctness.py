@@ -1,4 +1,3 @@
-import textwrap
 from pathlib import Path
 from influence_curriculum.data import DataConfig, load_documents
 
