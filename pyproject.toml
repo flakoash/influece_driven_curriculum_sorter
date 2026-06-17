@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["jupyterlab", "pytest", "ipykernel"]
+dev = ["jupyterlab", "pytest", "ipykernel", "huggingface_hub>=0.23"]
 
 [build-system]
 requires = ["hatchling"]

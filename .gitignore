@@ -9,3 +9,4 @@ build/
 .pytest_cache/
 *.npy
 .DS_Store
+datasets/
