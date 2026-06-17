@@ -18,7 +18,7 @@ class InfluenceConfig:
 
 def _doc_gradient(model: torch.nn.Module, input_ids: torch.Tensor, device: str) -> np.ndarray:
     model.zero_grad()
-    ids = input_ids.unsqueeze(0).to(device)
+    ids = (input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0)).to(device)
     outputs = model(input_ids=ids, labels=ids)
     outputs.loss.backward()
     emb = model.get_input_embeddings()
@@ -44,10 +44,11 @@ def compute_influence_matrix(
     for t, ckpt in enumerate(checkpoint_paths):
         model = AutoModelForCausalLM.from_pretrained(ckpt).to(device)
         model.eval()
-        V = model.get_input_embeddings().weight.numel()
+        grad_dim = model.get_input_embeddings().weight.numel()
 
+        # Two-pass recompute: avoids storing D dense gradient vectors simultaneously (memory bound).
         # Pass 1: mean gradient
-        mean_g = np.zeros(V, dtype=np.float64)
+        mean_g = np.zeros(grad_dim, dtype=np.float64)
         for enc in encodings:
             g = _doc_gradient(model, enc["input_ids"], device)
             if config.normalize:
