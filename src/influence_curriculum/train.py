@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,11 +35,15 @@ class _TokenDataset(Dataset):
         return {k: v.squeeze(0) for k, v in self.encodings[i].items()}
 
 
-def _collate(batch: list[dict]) -> dict:
-    import torch
+def _collate(batch: list[dict], tokenizer) -> dict:
+    pad_values = {
+        "input_ids": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+        "labels": -100,
+        "attention_mask": 0,
+    }
     keys = batch[0].keys()
     return {k: torch.nn.utils.rnn.pad_sequence(
-        [b[k] for b in batch], batch_first=True, padding_value=0
+        [b[k] for b in batch], batch_first=True, padding_value=pad_values.get(k, 0)
     ) for k in keys}
 
 
@@ -52,7 +57,10 @@ def train_surrogate(
     device: str,
 ) -> list[str]:
     torch.manual_seed(seed)
-    random.seed(seed)
+
+    # Re-initialize all weights from scratch (spec: architecture only, not weights)
+    torch.manual_seed(seed)
+    model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
 
     encodings = [
         tokenizer(t, truncation=True, max_length=config.max_seq_len, return_tensors="pt")
@@ -71,7 +79,7 @@ def train_surrogate(
         weight_decay=config.weight_decay,
     )
     grad_accum = max(1, config.effective_batch_size // config.per_device_batch_size)
-    steps_per_epoch = max(1, len(dataset) // config.per_device_batch_size)
+    steps_per_epoch = max(1, math.ceil(len(dataset) / config.per_device_batch_size))
     total_steps = config.epochs * steps_per_epoch // grad_accum
     scheduler = get_scheduler(
         config.lr_scheduler, optimizer=optimizer,
@@ -89,7 +97,7 @@ def train_surrogate(
         rng.shuffle(indices)
         loader = DataLoader(
             dataset, batch_size=config.per_device_batch_size,
-            sampler=indices, collate_fn=_collate,
+            sampler=indices, collate_fn=lambda batch: _collate(batch, tokenizer),
         )
         optimizer.zero_grad()
         for step, batch in enumerate(loader):
@@ -102,9 +110,17 @@ def train_surrogate(
                 scheduler.step()
                 optimizer.zero_grad()
 
+        # flush any remaining accumulated gradients
+        if len(loader) % grad_accum != 0:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
         path = str(ckpt_dir / f"epoch_{epoch:02d}")
         model.save_pretrained(path)
         tokenizer.save_pretrained(path)
         checkpoint_paths.append(path)
 
+    model.eval()
+    optimizer.zero_grad()
     return checkpoint_paths
