@@ -1,6 +1,8 @@
+import json
 from pathlib import Path
 import numpy as np
 from influence_curriculum.data import DataConfig, load_documents
+from influence_curriculum.curriculum import CurriculumConfig, build_curriculum
 
 
 def test_line_segmentation(tmp_path):
@@ -36,3 +38,32 @@ def test_mean_gradient_identity():
     pairwise = np.array([(1 / D) * (grads[i] @ grads.T).sum()          # O(D^2)
                          for i in range(D)])
     np.testing.assert_allclose(efficient, pairwise, rtol=1e-5)
+
+
+def test_permutation_validity(tmp_path):
+    D, T = 20, 3
+    rng = np.random.default_rng(42)
+    Phi = rng.random((D, T)).astype(np.float32)
+    texts = [f"doc {i}" for i in range(D)]
+    doc_ids = [f"fake#{i}" for i in range(D)]
+    build_curriculum(Phi, texts, doc_ids, CurriculumConfig(segment_size=5), str(tmp_path), seed=0)
+    for e in range(T):
+        path = tmp_path / "curriculum" / f"epoch_{e:02d}.jsonl"
+        assert path.exists()
+        ids = [json.loads(l)["id"] for l in path.read_text().splitlines()]
+        assert sorted(ids) == sorted(doc_ids), f"epoch {e} is not a permutation"
+
+
+def test_determinism(tmp_path):
+    D, T = 10, 2
+    rng = np.random.default_rng(7)
+    Phi = rng.random((D, T)).astype(np.float32)
+    texts = [f"doc {i}" for i in range(D)]
+    doc_ids = [f"fake#{i}" for i in range(D)]
+    cfg = CurriculumConfig()
+    build_curriculum(Phi, texts, doc_ids, cfg, str(tmp_path / "r1"), seed=42)
+    build_curriculum(Phi, texts, doc_ids, cfg, str(tmp_path / "r2"), seed=42)
+    for e in range(T):
+        f1 = (tmp_path / "r1" / "curriculum" / f"epoch_{e:02d}.jsonl").read_text()
+        f2 = (tmp_path / "r2" / "curriculum" / f"epoch_{e:02d}.jsonl").read_text()
+        assert f1 == f2, f"epoch {e} differs between identical runs"
