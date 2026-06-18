@@ -3,18 +3,23 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
 
 @dataclass
 class CurriculumConfig:
+    strategy: Literal["epoch_wise", "cumulative"] = "epoch_wise"
+    # epoch_wise options
     aggregation: str = "per_epoch_raw"   # "per_epoch_raw" | "lognormal"
     direction: str = "asc"               # "asc" | "desc"
     segment_size: int = 1000
     lognormal_window: int = 10
     lognormal_mu: float = 0.0
     lognormal_sigma: float = 1.0
+    # cumulative options
+    n_groups: int = 2                    # number of difficulty groups (= number of output epochs)
 
 
 def _lognormal_kernel(window: int, mu: float, sigma: float) -> np.ndarray:
@@ -36,6 +41,10 @@ def build_curriculum(
     rng = random.Random(seed)
     out = Path(output_dir) / "curriculum"
     out.mkdir(parents=True, exist_ok=True)
+
+    if config.strategy == "cumulative":
+        _build_cumulative(Phi, texts, doc_ids, config, out, rng)
+        return
 
     if config.aggregation == "lognormal":
         h = _lognormal_kernel(config.lognormal_window, config.lognormal_mu, config.lognormal_sigma)
@@ -62,4 +71,36 @@ def build_curriculum(
 
         with open(out / f"epoch_{e:02d}.jsonl", "w") as f:
             for idx in shuffled:
+                f.write(json.dumps({"id": doc_ids[idx], "text": texts[idx]}) + "\n")
+
+
+def _build_cumulative(
+    Phi: np.ndarray,
+    texts: list[str],
+    doc_ids: list[str],
+    config: CurriculumConfig,
+    out: Path,
+    rng: random.Random,
+) -> None:
+    D = Phi.shape[0]
+    G = config.n_groups
+
+    # aggregate across all checkpoints → one difficulty score per doc
+    agg = Phi.mean(axis=1)
+    order = np.argsort(agg)  # ascending: easy → hard
+
+    # split into G equal groups
+    boundaries = [round(D * g / G) for g in range(G + 1)]
+    groups = [order[boundaries[g] : boundaries[g + 1]].tolist() for g in range(G)]
+
+    # epoch k includes groups 0..k (growing subset)
+    for k in range(G):
+        subset: list[int] = []
+        for g in range(k + 1):
+            seg = groups[g][:]
+            rng.shuffle(seg)
+            subset.extend(seg)
+
+        with open(out / f"epoch_{k:02d}.jsonl", "w") as f:
+            for idx in subset:
                 f.write(json.dumps({"id": doc_ids[idx], "text": texts[idx]}) + "\n")

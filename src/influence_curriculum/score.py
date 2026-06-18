@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,6 +18,10 @@ class InfluenceConfig:
 
 
 def _doc_gradient(model: torch.nn.Module, input_ids: torch.Tensor, device: str) -> np.ndarray:
+    """
+    Compute the gradient of the loss with respect to the input embedding w for a single document
+    using embeddings as it should capture which vocabulary items the model is 'surprised by' in this doc
+    """
     model.zero_grad()
     ids = (input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0)).to(device)
     outputs = model(input_ids=ids, labels=ids)
