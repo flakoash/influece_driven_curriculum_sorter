@@ -60,10 +60,8 @@ def train_surrogate(
     torch.manual_seed(seed)
     model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
 
-    encodings = [
-        tokenizer(t, truncation=True, max_length=config.max_seq_len, return_tensors="pt")
-        for t in texts
-    ]
+    batch_out = tokenizer(texts, truncation=True, max_length=config.max_seq_len, padding=False, return_tensors=None)
+    encodings = [{k: torch.tensor([v[i]]) for k, v in batch_out.items()} for i in range(len(texts))]
     dataset = _TokenDataset(encodings)
 
     model = model.to(device)

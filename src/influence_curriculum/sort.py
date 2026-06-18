@@ -54,10 +54,8 @@ def sort_by_influence(
 
     # Phase 0: load + tokenize
     texts, doc_ids = load_documents(dataset_dir, data_config, tokenizer)
-    encodings = [
-        tokenizer(t, truncation=True, max_length=training_config.max_seq_len, return_tensors="pt")
-        for t in texts
-    ]
+    batch_out = tokenizer(texts, truncation=True, max_length=training_config.max_seq_len, padding=False, return_tensors=None)
+    encodings = [{k: torch.tensor([v[i]]) for k, v in batch_out.items()} for i in range(len(texts))]
 
     # Phase 1: surrogate
     if checkpoints is None:
