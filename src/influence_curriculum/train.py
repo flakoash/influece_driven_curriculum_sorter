@@ -6,8 +6,14 @@ from pathlib import Path
 
 import torch
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, TensorDataset
 from transformers import get_scheduler
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(it, **_):  # type: ignore[misc]
+        return it
 
 
 @dataclass
@@ -24,29 +30,6 @@ class TrainingConfig:
     fp16: bool = False
 
 
-class _TokenDataset(Dataset):
-    def __init__(self, encodings: list[dict]):
-        self.encodings = encodings
-
-    def __len__(self) -> int:
-        return len(self.encodings)
-
-    def __getitem__(self, i: int) -> dict:
-        return {k: v.squeeze(0) for k, v in self.encodings[i].items()}
-
-
-def _collate(batch: list[dict], tokenizer) -> dict:
-    pad_values = {
-        "input_ids": tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-        "labels": -100,
-        "attention_mask": 0,
-    }
-    keys = batch[0].keys()
-    return {k: torch.nn.utils.rnn.pad_sequence(
-        [b[k] for b in batch], batch_first=True, padding_value=pad_values.get(k, 0)
-    ) for k in keys}
-
-
 def train_surrogate(
     model: torch.nn.Module,
     tokenizer,
@@ -56,13 +39,20 @@ def train_surrogate(
     seed: int,
     device: str,
 ) -> list[str]:
-    # Re-initialize all weights from scratch (spec: architecture only, not weights)
     torch.manual_seed(seed)
-    model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
+    model.apply(lambda m: m.reset_parameters() if hasattr(m, "reset_parameters") else None)
 
-    batch_out = tokenizer(texts, truncation=True, max_length=config.max_seq_len, padding=False, return_tensors=None)
-    encodings = [{k: torch.tensor([v[i]]) for k, v in batch_out.items()} for i in range(len(texts))]
-    dataset = _TokenDataset(encodings)
+    # Pre-pad to fixed length → TensorDataset with no per-batch collation overhead
+    batch_out = tokenizer(
+        texts,
+        truncation=True,
+        max_length=config.max_seq_len,
+        padding="max_length",
+        return_tensors="pt",
+    )
+    input_ids = batch_out["input_ids"]       # (N, L)
+    attn_mask = batch_out["attention_mask"]  # (N, L)
+    dataset = TensorDataset(input_ids, attn_mask)
 
     model = model.to(device)
     model.train()
@@ -86,38 +76,58 @@ def train_surrogate(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_paths: list[str] = []
 
+    pin = device == "cuda"
     indices = list(range(len(dataset)))
     rng = random.Random(seed)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=config.fp16)
+    pbar = tqdm(total=total_steps, desc="surrogate", unit="step")
 
     for epoch in range(config.epochs):
         rng.shuffle(indices)
         loader = DataLoader(
-            dataset, batch_size=config.per_device_batch_size,
-            sampler=indices, collate_fn=lambda batch: _collate(batch, tokenizer),
+            dataset,
+            batch_size=config.per_device_batch_size,
+            sampler=indices,
+            pin_memory=pin,
         )
         optimizer.zero_grad()
-        for step, batch in enumerate(loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            model_inputs = {k: v for k, v in batch.items() if k != "labels"}
-            outputs = model(**model_inputs, labels=labels)
-            (outputs.loss / grad_accum).backward()
+        running_loss, accum_count = 0.0, 0
+
+        for step, (ids, mask) in enumerate(loader):
+            ids  = ids.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            labels = ids.clone()
+            labels[mask == 0] = -100   # ignore padding in loss
+            with torch.cuda.amp.autocast(enabled=config.fp16):
+                outputs = model(input_ids=ids, attention_mask=mask, labels=labels)
+            scaler.scale(outputs.loss / grad_accum).backward()
+            running_loss += outputs.loss.item()
+            accum_count += 1
+
             if (step + 1) % grad_accum == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
+                pbar.update(1)
+                pbar.set_postfix(epoch=epoch, loss=f"{running_loss/accum_count:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+                running_loss, accum_count = 0.0, 0
 
-        # flush any remaining accumulated gradients
         if len(loader) % grad_accum != 0:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
+            pbar.update(1)
 
         path = str(ckpt_dir / f"epoch_{epoch:02d}")
         model.save_pretrained(path)
         tokenizer.save_pretrained(path)
         checkpoint_paths.append(path)
+        tqdm.write(f"epoch {epoch:02d} done — checkpoint saved to {path}")
 
+    pbar.close()
     model.eval()
     optimizer.zero_grad()
     return checkpoint_paths

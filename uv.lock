@@ -761,6 +761,7 @@ dependencies = [
     { name = "numpy" },
     { name = "scipy" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -782,6 +783,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "scipy", specifier = ">=1.13" },
     { name = "torch", specifier = ">=2.3" },
+    { name = "tqdm", specifier = ">=4.66" },
     { name = "transformers", specifier = ">=4.40" },
 ]
 provides-extras = ["dev"]
