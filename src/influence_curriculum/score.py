@@ -28,7 +28,8 @@ class InfluenceConfig:
     normalize: bool = True
     memory_route: str = "recompute"
     projection_dim: int = 0
-    grad_batch_size: int = 16   # docs per vmap batch; reduce if OOM
+    grad_batch_size: int = 4    # docs per vmap batch; reduce to 2 if OOM, increase to 8+ if fast
+    fp16: bool = True           # load model in fp16 for influence (halves GPU memory)
 
 
 def _unit(g: np.ndarray) -> np.ndarray:
@@ -106,7 +107,10 @@ def compute_influence_matrix(
     for t, ckpt in enumerate(checkpoint_paths):
         # eager attention avoids SDPA's .item() calls which are vmap-incompatible
         attn_impl = "eager" if use_vmap else "sdpa"
-        model = AutoModelForCausalLM.from_pretrained(ckpt, attn_implementation=attn_impl).to(device)
+        dtype = torch.float16 if (config.fp16 and device != "cpu") else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            ckpt, attn_implementation=attn_impl, torch_dtype=dtype,
+        ).to(device)
         model.eval()
 
         emb = model.get_input_embeddings()
@@ -123,10 +127,13 @@ def compute_influence_matrix(
             for start in tqdm(range(0, D, B), desc=f"ckpt {t} pass1", total=n_batches, leave=False):
                 batch_ids   = all_ids[start:start + B].to(device)
                 batch_masks = all_masks[start:start + B].to(device)
-                g = _vmap_grads(model, params, buffers, emb_name, batch_ids, batch_masks).double().cpu()
+                g = _vmap_grads(model, params, buffers, emb_name, batch_ids, batch_masks).float().double().cpu()
                 if config.normalize:
                     g = _unit_batch(g.float()).double()
                 mean_g += g.sum(dim=0)
+                del g, batch_ids, batch_masks
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
             mean_g = (mean_g / D).float()
 
             # Pass 2: per-doc scores (batched dot product)
@@ -138,6 +145,9 @@ def compute_influence_matrix(
                 if config.normalize:
                     g = _unit_batch(g)
                 Phi[start:start + actual, t] = (g @ mean_g).numpy()
+                del g, batch_ids, batch_masks
+                if device.startswith("cuda"):
+                    torch.cuda.empty_cache()
 
         else:
             # Fallback: per-doc loop
@@ -160,7 +170,7 @@ def compute_influence_matrix(
                     g = _unit(g)
                 Phi[i, t] = float(np.dot(g, mean_g_np))
 
-        del model
+        del model, params, buffers
         if device.startswith("cuda"):
             torch.cuda.empty_cache()
 
