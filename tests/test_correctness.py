@@ -75,7 +75,7 @@ def test_vmap_matches_fallback():
     MODEL = "sshleifer/tiny-gpt2"
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(MODEL, attn_implementation="eager")
     model.eval()
 
     texts = ["The cat sat.", "Dogs are great.", "I love ML."]
@@ -96,11 +96,11 @@ def test_vmap_matches_fallback():
         for enc in encodings
     ])  # (3, max_len)
 
-    vmap_g = _vmap_grads(model, params, buffers, emb_name, padded).float()  # (3, grad_dim)
+    masks  = torch.ones_like(padded)   # all tokens real (no padding in this test)
+    vmap_g = _vmap_grads(model, params, buffers, emb_name, padded, masks).float()
 
     for i in range(len(texts)):
-        # Fallback uses the same padded 2-D tensor as vmap
-        fallback = torch.tensor(_fallback_grad(model, padded[i].unsqueeze(0), "cpu"))
+        fallback = torch.tensor(_fallback_grad(model, padded[i], masks[i], "cpu"))
         diff = (vmap_g[i] - fallback).abs().max().item()
         assert diff < 1e-3, f"doc {i}: vmap vs fallback max diff = {diff:.2e}"
 
