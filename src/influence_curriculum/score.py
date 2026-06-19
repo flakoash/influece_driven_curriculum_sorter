@@ -194,7 +194,8 @@ def compute_influence_matrix(
             other_params = {n: p.detach() for n, p in model.named_parameters() if n != emb_name}
             buffers = dict(model.named_buffers())
             emb_w = emb.weight.detach()
-            mean_g_dev = mean_g.to(device)
+            # tangent must have same dtype as the primal (emb_w); mean_g is float32
+            mean_g_dev = mean_g.to(device=device, dtype=emb_w.dtype)
 
             for i in tqdm(range(D), desc=f"ckpt {t} pass2", leave=False):
                 ids  = all_ids[i:i + 1].to(device)
