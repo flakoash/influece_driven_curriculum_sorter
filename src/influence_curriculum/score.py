@@ -37,6 +37,7 @@ class InfluenceConfig:
     memory_route: str = "recompute"
     projection_dim: int = 0
     grad_batch_size: int = 4    # batch size for pass-2 JVP (safe on T4; increase for speed)
+    pass1_batch_size: int = 32  # batch size for pass-1 mean-gradient backward; reduce if OOM
     fp16: bool = True           # load influence model in fp16 to halve GPU memory
 
 
@@ -167,7 +168,7 @@ def compute_influence_matrix(
         for p in model.parameters():
             p.requires_grad_(p is emb.weight)
 
-        B1 = 256   # large batch; standard backward, no per-sample graph
+        B1 = config.pass1_batch_size
         n_b1 = math.ceil(D / B1)
         mean_g = torch.zeros(grad_dim, dtype=torch.float32)
 
