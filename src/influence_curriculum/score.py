@@ -152,7 +152,9 @@ def compute_influence_matrix(
 
     for t, ckpt in enumerate(checkpoint_paths):
         model = AutoModelForCausalLM.from_pretrained(ckpt, attn_implementation="sdpa")
-        if config.fp16 and device != "cpu":
+        # fp16 breaks JVP tangent propagation (dtype mismatch at LayerNorm/GELU).
+        # Per-doc JVP peak memory is tiny (~200 MB), so fp32 is fine.
+        if config.fp16 and device != "cpu" and not use_jvp:
             model = model.half()
         model = model.to(device).eval()
 
@@ -193,9 +195,8 @@ def compute_influence_matrix(
             # JVP never calls create_graph=True — no memory accumulation across docs.
             other_params = {n: p.detach() for n, p in model.named_parameters() if n != emb_name}
             buffers = dict(model.named_buffers())
-            emb_w = emb.weight.detach()
-            # tangent must have same dtype as the primal (emb_w); mean_g is float32
-            mean_g_dev = mean_g.to(device=device, dtype=emb_w.dtype)
+            emb_w = emb.weight.detach()   # fp32 when use_jvp=True
+            mean_g_dev = mean_g.to(device)
 
             for i in tqdm(range(D), desc=f"ckpt {t} pass2", leave=False):
                 ids  = all_ids[i:i + 1].to(device)
