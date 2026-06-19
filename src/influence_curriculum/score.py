@@ -10,7 +10,14 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 try:
-    from torch.func import functional_call, grad as fgrad, vmap
+    from torch.func import functional_call, jvp
+    _HAS_JVP = True
+except ImportError:
+    _HAS_JVP = False
+
+# Legacy vmap flag kept for test compatibility
+try:
+    from torch.func import grad as fgrad, vmap
     _HAS_VMAP = True
 except ImportError:
     _HAS_VMAP = False
@@ -29,7 +36,7 @@ class InfluenceConfig:
     normalize: bool = True
     memory_route: str = "recompute"
     projection_dim: int = 0
-    grad_batch_size: int = 4    # docs per vmap batch; reduce to 2 if OOM
+    grad_batch_size: int = 4    # batch size for pass-2 JVP (safe on T4; increase for speed)
     fp16: bool = True           # load influence model in fp16 to halve GPU memory
 
 
@@ -44,13 +51,10 @@ def _unit_batch(t: torch.Tensor) -> torch.Tensor:
     return t / norms
 
 
-def _vmap_grads(model, emb_name, batch_ids, batch_masks):
-    """Per-sample embedding gradients via vmap.
+# ── kept for test_correctness.py ─────────────────────────────────────────────
 
-    Uses argnums=0 so only the embedding gradient is materialised —
-    gradients for the other ~80M parameters are never allocated.
-    Shape returned: (B, vocab*hidden).
-    """
+def _vmap_grads(model, emb_name, batch_ids, batch_masks):
+    """Per-sample embedding gradients via vmap (test helper only — see _jvp_score)."""
     emb_weight = dict(model.named_parameters())[emb_name]
     other_params = {n: p for n, p in model.named_parameters() if n != emb_name}
     buffers = dict(model.named_buffers())
@@ -65,14 +69,15 @@ def _vmap_grads(model, emb_name, batch_ids, batch_masks):
         )
         return out.loss
 
-    # argnums=0 → only grad w.r.t. emb_w; in_dims=(None,0,0) → emb shared, ids/masks batched
     per_sample = vmap(fgrad(loss_fn, argnums=0), in_dims=(None, 0, 0))
-    emb_grad = per_sample(emb_weight, batch_ids, batch_masks)  # (B, vocab, hidden)
-    return emb_grad.reshape(len(batch_ids), -1)                # (B, grad_dim)
+    emb_grad = per_sample(emb_weight, batch_ids, batch_masks)
+    return emb_grad.reshape(len(batch_ids), -1)
 
+
+# ── production helpers ────────────────────────────────────────────────────────
 
 def _fallback_grad(model, ids, mask, device):
-    """Per-doc gradient without vmap."""
+    """Per-doc gradient without vmap (CPU fallback)."""
     ids  = (ids  if ids.dim()  == 2 else ids.unsqueeze(0)).to(device)
     mask = (mask if mask.dim() == 2 else mask.unsqueeze(0)).to(device)
     labels = ids.clone()
@@ -81,6 +86,24 @@ def _fallback_grad(model, ids, mask, device):
     out = model(input_ids=ids, attention_mask=mask, labels=labels)
     (g,) = torch.autograd.grad(out.loss, emb.weight)
     return g.detach().cpu().float().numpy().ravel().copy()
+
+
+def _jvp_score(model, emb_name, other_params, buffers, emb_w, ids, mask, mean_g):
+    """Directional derivative ∂loss/∂emb_w · mean_g for one doc via JVP.
+
+    Forward-mode AD: no backward graph, no create_graph=True, no memory accumulation.
+    """
+    def f_emb(w):
+        labels = torch.where(mask.bool(), ids, torch.full_like(ids, -100))
+        all_p = {**other_params, emb_name: w}
+        return functional_call(
+            model, (all_p, buffers), args=(),
+            kwargs={"input_ids": ids.unsqueeze(0), "attention_mask": mask.unsqueeze(0),
+                    "labels": labels.unsqueeze(0)},
+        ).loss
+
+    _, tangent = jvp(f_emb, (emb_w,), (mean_g,))
+    return tangent.item()
 
 
 def _pad_encodings(encodings: list[dict]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -96,8 +119,10 @@ def _pad_encodings(encodings: list[dict]) -> tuple[torch.Tensor, torch.Tensor]:
             mask = F.pad(mask, (0, pad_len), value=0)
         pad_ids.append(ids)
         pad_masks.append(mask)
-    return torch.stack(pad_ids), torch.stack(pad_masks)   # (D, max_len) each
+    return torch.stack(pad_ids), torch.stack(pad_masks)
 
+
+# ── main entry point ──────────────────────────────────────────────────────────
 
 def compute_influence_matrix(
     checkpoint_paths: list[str],
@@ -105,87 +130,89 @@ def compute_influence_matrix(
     config: InfluenceConfig,
     device: str,
 ) -> np.ndarray:
+    """Compute Phi[i,t] = influence of doc i at checkpoint t.
+
+    Algorithm:
+      pass 1 – mean embedding gradient via mini-batch backward (B=256, fast)
+      pass 2 – per-doc score via JVP (forward-mode AD, no backward graph → no OOM)
+    """
     D = len(encodings)
     if D == 0:
         raise ValueError("encodings list is empty — no documents to score")
     T = len(checkpoint_paths)
     Phi = np.zeros((D, T), dtype=np.float32)
-    B = config.grad_batch_size
 
     all_ids, all_masks = _pad_encodings(encodings)   # (D, L) on CPU
 
-    use_vmap = _HAS_VMAP and device != "cpu"
+    use_jvp = _HAS_JVP and device != "cpu"
 
-    # Free any cached GPU memory from earlier cells before heavy allocations
     if device.startswith("cuda"):
         gc.collect()
         torch.cuda.empty_cache()
 
     for t, ckpt in enumerate(checkpoint_paths):
-        # eager attention: avoids SDPA .item() calls that break vmap
-        attn_impl = "eager" if use_vmap else "sdpa"
-        model = AutoModelForCausalLM.from_pretrained(ckpt, attn_implementation=attn_impl)
+        model = AutoModelForCausalLM.from_pretrained(ckpt, attn_implementation="sdpa")
         if config.fp16 and device != "cpu":
-            model = model.half()   # avoids deprecated torch_dtype kwarg
-        model = model.to(device)
-        model.eval()
+            model = model.half()
+        model = model.to(device).eval()
 
         emb = model.get_input_embeddings()
+        emb_name = next(n for n, p in model.named_parameters() if p is emb.weight)
         grad_dim = emb.weight.numel()
 
-        if use_vmap:
-            emb_name = next(n for n, p in model.named_parameters() if p is emb.weight)
-            n_batches = math.ceil(D / B)
+        # ── Pass 1: mean gradient via mini-batch backward ─────────────────────
+        # Only the embedding weight needs gradients — saves memory during backward.
+        for p in model.parameters():
+            p.requires_grad_(p is emb.weight)
 
-            # Pass 1: mean gradient (fp32 on CPU — no fp64 on GPU)
-            mean_g = torch.zeros(grad_dim, dtype=torch.float32)
-            for start in tqdm(range(0, D, B), desc=f"ckpt {t} pass1", total=n_batches, leave=False):
-                batch_ids   = all_ids[start:start + B].to(device)
-                batch_masks = all_masks[start:start + B].to(device)
-                g = _vmap_grads(model, emb_name, batch_ids, batch_masks).float().cpu()
-                if config.normalize:
-                    g = _unit_batch(g)
-                mean_g += g.sum(dim=0)
-                del g, batch_ids, batch_masks
-                if device.startswith("cuda"):
-                    torch.cuda.empty_cache()
-            mean_g /= D
+        B1 = 256   # large batch; standard backward, no per-sample graph
+        n_b1 = math.ceil(D / B1)
+        mean_g = torch.zeros(grad_dim, dtype=torch.float32)
 
-            # Pass 2: per-doc scores (dot product on CPU)
-            for start in tqdm(range(0, D, B), desc=f"ckpt {t} pass2", total=n_batches, leave=False):
-                batch_ids   = all_ids[start:start + B].to(device)
-                batch_masks = all_masks[start:start + B].to(device)
-                actual = batch_ids.shape[0]
-                g = _vmap_grads(model, emb_name, batch_ids, batch_masks).float().cpu()
-                if config.normalize:
-                    g = _unit_batch(g)
-                Phi[start:start + actual, t] = (g @ mean_g).numpy()
-                del g, batch_ids, batch_masks
-                if device.startswith("cuda"):
-                    torch.cuda.empty_cache()
+        for start in tqdm(range(0, D, B1), desc=f"ckpt {t} pass1", total=n_b1, leave=False):
+            ids  = all_ids[start:start + B1].to(device)
+            mask = all_masks[start:start + B1].to(device)
+            n_doc = ids.shape[0]
+            labels = torch.where(mask.bool(), ids, torch.full_like(ids, -100))
+            # multiply by n_doc so we can sum→mean correctly across batches
+            loss = model(input_ids=ids, attention_mask=mask, labels=labels).loss * n_doc
+            loss.backward()
+            mean_g += emb.weight.grad.detach().cpu().float().ravel() * n_doc
+            emb.weight.grad = None
+            del ids, mask, labels, loss
 
-        else:
-            # Fallback: per-doc backward loop (no vmap)
-            emb.weight.requires_grad_(True)
-            for p in model.parameters():
-                if p is not emb.weight:
-                    p.requires_grad_(False)
+        mean_g /= D
+        if config.normalize:
+            n = mean_g.norm().item()
+            if n > 1e-10:
+                mean_g = mean_g / n
 
-            mean_g_np = np.zeros(grad_dim, dtype=np.float64)
-            for i in tqdm(range(D), desc=f"ckpt {t} pass1", leave=False):
-                g = _fallback_grad(model, all_ids[i], all_masks[i], device)
-                if config.normalize:
-                    g = _unit(g)
-                mean_g_np += g
-            mean_g_np /= D
+        # ── Pass 2: per-doc scores ────────────────────────────────────────────
+        if use_jvp:
+            # Forward-mode AD: directional derivative ∂loss/∂emb · mean_g.
+            # JVP never calls create_graph=True — no memory accumulation across docs.
+            other_params = {n: p.detach() for n, p in model.named_parameters() if n != emb_name}
+            buffers = dict(model.named_buffers())
+            emb_w = emb.weight.detach()
+            mean_g_dev = mean_g.to(device)
 
             for i in tqdm(range(D), desc=f"ckpt {t} pass2", leave=False):
+                ids  = all_ids[i:i + 1].to(device)
+                mask = all_masks[i:i + 1].to(device)
+                Phi[i, t] = _jvp_score(model, emb_name, other_params, buffers,
+                                        emb_w, ids[0], mask[0], mean_g_dev)
+                del ids, mask
+
+        else:
+            # CPU fallback: per-doc backward (no torch.func required)
+            mean_g_np = mean_g.numpy()
+            for i in tqdm(range(D), desc=f"ckpt {t} pass2 (cpu)", leave=False):
                 g = _fallback_grad(model, all_ids[i], all_masks[i], device)
                 if config.normalize:
                     g = _unit(g)
                 Phi[i, t] = float(np.dot(g, mean_g_np))
 
-        del model
+        del model, mean_g
         if device.startswith("cuda"):
             gc.collect()
             torch.cuda.empty_cache()
