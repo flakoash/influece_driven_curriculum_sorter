@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 from dataclasses import dataclass
 
@@ -28,8 +29,8 @@ class InfluenceConfig:
     normalize: bool = True
     memory_route: str = "recompute"
     projection_dim: int = 0
-    grad_batch_size: int = 4    # docs per vmap batch; reduce to 2 if OOM, increase to 8+ if fast
-    fp16: bool = True           # load model in fp16 for influence (halves GPU memory)
+    grad_batch_size: int = 4    # docs per vmap batch; reduce to 2 if OOM
+    fp16: bool = True           # load influence model in fp16 to halve GPU memory
 
 
 def _unit(g: np.ndarray) -> np.ndarray:
@@ -43,20 +44,31 @@ def _unit_batch(t: torch.Tensor) -> torch.Tensor:
     return t / norms
 
 
-def _vmap_grads(model, params, buffers, emb_name, batch_ids, batch_masks):
-    """Per-sample embedding gradients via vmap. Shape: (B, vocab*hidden)."""
-    def loss_fn(params, buffers, ids, mask):
-        # torch.where is vmap-compatible; boolean mask indexing is not
+def _vmap_grads(model, emb_name, batch_ids, batch_masks):
+    """Per-sample embedding gradients via vmap.
+
+    Uses argnums=0 so only the embedding gradient is materialised —
+    gradients for the other ~80M parameters are never allocated.
+    Shape returned: (B, vocab*hidden).
+    """
+    emb_weight = dict(model.named_parameters())[emb_name]
+    other_params = {n: p for n, p in model.named_parameters() if n != emb_name}
+    buffers = dict(model.named_buffers())
+
+    def loss_fn(emb_w, ids, mask):
         labels = torch.where(mask.bool(), ids, torch.full_like(ids, -100))
+        all_params = {**other_params, emb_name: emb_w}
         out = functional_call(
-            model, (params, buffers), args=(),
-            kwargs={"input_ids": ids.unsqueeze(0), "attention_mask": mask.unsqueeze(0), "labels": labels.unsqueeze(0)},
+            model, (all_params, buffers), args=(),
+            kwargs={"input_ids": ids.unsqueeze(0), "attention_mask": mask.unsqueeze(0),
+                    "labels": labels.unsqueeze(0)},
         )
         return out.loss
 
-    per_sample = vmap(fgrad(loss_fn), in_dims=(None, None, 0, 0))
-    grads_dict = per_sample(params, buffers, batch_ids, batch_masks)
-    return grads_dict[emb_name].reshape(len(batch_ids), -1)   # (B, grad_dim)
+    # argnums=0 → only grad w.r.t. emb_w; in_dims=(None,0,0) → emb shared, ids/masks batched
+    per_sample = vmap(fgrad(loss_fn, argnums=0), in_dims=(None, 0, 0))
+    emb_grad = per_sample(emb_weight, batch_ids, batch_masks)  # (B, vocab, hidden)
+    return emb_grad.reshape(len(batch_ids), -1)                # (B, grad_dim)
 
 
 def _fallback_grad(model, ids, mask, device):
@@ -100,17 +112,22 @@ def compute_influence_matrix(
     Phi = np.zeros((D, T), dtype=np.float32)
     B = config.grad_batch_size
 
-    all_ids, all_masks = _pad_encodings(encodings)   # (D, L) — handles variable lengths
+    all_ids, all_masks = _pad_encodings(encodings)   # (D, L) on CPU
 
     use_vmap = _HAS_VMAP and device != "cpu"
 
+    # Free any cached GPU memory from earlier cells before heavy allocations
+    if device.startswith("cuda"):
+        gc.collect()
+        torch.cuda.empty_cache()
+
     for t, ckpt in enumerate(checkpoint_paths):
-        # eager attention avoids SDPA's .item() calls which are vmap-incompatible
+        # eager attention: avoids SDPA .item() calls that break vmap
         attn_impl = "eager" if use_vmap else "sdpa"
-        dtype = torch.float16 if (config.fp16 and device != "cpu") else torch.float32
-        model = AutoModelForCausalLM.from_pretrained(
-            ckpt, attn_implementation=attn_impl, torch_dtype=dtype,
-        ).to(device)
+        model = AutoModelForCausalLM.from_pretrained(ckpt, attn_implementation=attn_impl)
+        if config.fp16 and device != "cpu":
+            model = model.half()   # avoids deprecated torch_dtype kwarg
+        model = model.to(device)
         model.eval()
 
         emb = model.get_input_embeddings()
@@ -118,30 +135,28 @@ def compute_influence_matrix(
 
         if use_vmap:
             emb_name = next(n for n, p in model.named_parameters() if p is emb.weight)
-            params  = dict(model.named_parameters())
-            buffers = dict(model.named_buffers())
             n_batches = math.ceil(D / B)
 
-            # Pass 1: mean gradient (batched)
-            mean_g = torch.zeros(grad_dim, dtype=torch.float64)
+            # Pass 1: mean gradient (fp32 on CPU — no fp64 on GPU)
+            mean_g = torch.zeros(grad_dim, dtype=torch.float32)
             for start in tqdm(range(0, D, B), desc=f"ckpt {t} pass1", total=n_batches, leave=False):
                 batch_ids   = all_ids[start:start + B].to(device)
                 batch_masks = all_masks[start:start + B].to(device)
-                g = _vmap_grads(model, params, buffers, emb_name, batch_ids, batch_masks).float().double().cpu()
+                g = _vmap_grads(model, emb_name, batch_ids, batch_masks).float().cpu()
                 if config.normalize:
-                    g = _unit_batch(g.float()).double()
+                    g = _unit_batch(g)
                 mean_g += g.sum(dim=0)
                 del g, batch_ids, batch_masks
                 if device.startswith("cuda"):
                     torch.cuda.empty_cache()
-            mean_g = (mean_g / D).float()
+            mean_g /= D
 
-            # Pass 2: per-doc scores (batched dot product)
+            # Pass 2: per-doc scores (dot product on CPU)
             for start in tqdm(range(0, D, B), desc=f"ckpt {t} pass2", total=n_batches, leave=False):
                 batch_ids   = all_ids[start:start + B].to(device)
                 batch_masks = all_masks[start:start + B].to(device)
                 actual = batch_ids.shape[0]
-                g = _vmap_grads(model, params, buffers, emb_name, batch_ids, batch_masks).float().cpu()
+                g = _vmap_grads(model, emb_name, batch_ids, batch_masks).float().cpu()
                 if config.normalize:
                     g = _unit_batch(g)
                 Phi[start:start + actual, t] = (g @ mean_g).numpy()
@@ -150,7 +165,7 @@ def compute_influence_matrix(
                     torch.cuda.empty_cache()
 
         else:
-            # Fallback: per-doc loop
+            # Fallback: per-doc backward loop (no vmap)
             emb.weight.requires_grad_(True)
             for p in model.parameters():
                 if p is not emb.weight:
@@ -170,8 +185,9 @@ def compute_influence_matrix(
                     g = _unit(g)
                 Phi[i, t] = float(np.dot(g, mean_g_np))
 
-        del model, params, buffers
+        del model
         if device.startswith("cuda"):
+            gc.collect()
             torch.cuda.empty_cache()
 
     return Phi

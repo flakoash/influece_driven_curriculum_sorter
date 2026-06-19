@@ -83,8 +83,6 @@ def test_vmap_matches_fallback():
 
     emb_name = next(n for n, p in model.named_parameters()
                     if p is model.get_input_embeddings().weight)
-    params  = dict(model.named_parameters())
-    buffers = dict(model.named_buffers())
 
     # Pad all to same length — both approaches use the same padded ids
     max_len = max(enc["input_ids"].shape[-1] for enc in encodings)
@@ -97,7 +95,7 @@ def test_vmap_matches_fallback():
     ])  # (3, max_len)
 
     masks  = torch.ones_like(padded)   # all tokens real (no padding in this test)
-    vmap_g = _vmap_grads(model, params, buffers, emb_name, padded, masks).float()
+    vmap_g = _vmap_grads(model, emb_name, padded, masks).float()
 
     for i in range(len(texts)):
         fallback = torch.tensor(_fallback_grad(model, padded[i], masks[i], "cpu"))
