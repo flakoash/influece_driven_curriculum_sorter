@@ -102,7 +102,7 @@ def _jvp_score(model, emb_name, other_params, buffers, emb_w, ids, mask, mean_g)
                     "labels": labels.unsqueeze(0)},
         ).loss
 
-    _, tangent = jvp(f_emb, (emb_w,), (mean_g,))
+    _, tangent = jvp(f_emb, (emb_w,), (mean_g.reshape(emb_w.shape),))
     return tangent.item()
 
 
