@@ -1,7 +1,5 @@
 """Tests for train_curriculum — uses a tiny in-memory model and temp files."""
 import json
-import math
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -14,20 +12,6 @@ def _tiny_model():
     cfg = GPT2Config(n_embd=32, n_layer=2, n_head=2, n_inner=128,
                      vocab_size=50257, n_positions=16)
     return GPT2LMHeadModel(cfg)
-
-
-def _tiny_tokenizer():
-    # Use a real tokenizer but with a tiny vocab model — just need encode/decode
-    from transformers import PreTrainedTokenizerFast
-    from tokenizers import Tokenizer
-    from tokenizers.models import BPE
-    tok = Tokenizer(BPE())
-    from tokenizers.pre_tokenizers import Whitespace
-    tok.pre_tokenizer = Whitespace()
-    # Build minimal vocab: 0-99 as single-char tokens
-    wrapped = PreTrainedTokenizerFast(tokenizer_object=tok)
-    wrapped.add_special_tokens({"pad_token": "[PAD]", "eos_token": "[EOS]"})
-    return wrapped
 
 
 def _write_jsonl(path: Path, texts: list[str]) -> None:
@@ -65,7 +49,10 @@ def test_train_curriculum_returns_correct_shape(tmp_path):
 
     assert len(ckpt_paths) == 3, f"expected 3 checkpoints, got {len(ckpt_paths)}"
     assert len(history) == 3, f"expected 3 history entries, got {len(history)}"
-    assert history[0] == {"phase": 0, "epoch": 0, "loss": pytest.approx(history[0]["loss"], abs=1e9), "lr": pytest.approx(history[0]["lr"], abs=1e9)}
+    assert history[0]["phase"] == 0
+    assert history[0]["epoch"] == 0
+    assert isinstance(history[0]["loss"], float)
+    assert isinstance(history[0]["lr"], float)
     assert history[2]["phase"] == 1
     assert history[2]["epoch"] == 0
 
