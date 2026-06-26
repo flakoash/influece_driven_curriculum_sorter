@@ -302,3 +302,231 @@ def train_curriculum(
     pbar.close()
     model.eval()
     return checkpoint_paths, history
+
+
+def train_word_aware(
+    model: torch.nn.Module,
+    tokenizer,
+    phases: list[tuple[str, int]],
+    output_dir: str,
+    config: TrainingConfig,
+    seed: int,
+    device: str,
+    word_checkpoints: list[int],
+    checkpoint_names: dict[int, str] | None = None,
+    hub_repo: str | None = None,
+    hub_token: str | None = None,
+    start_words: int = 0,
+    start_phase: int = 0,
+    start_epoch: int = 0,
+) -> tuple[list[str], list[dict]]:
+    """Train with per-epoch checkpoints + word-count milestone checkpoints.
+
+    word_checkpoints: sorted list of cumulative word counts at which to save
+        a revision checkpoint named chck_{N} (e.g. [1_000_000, ..., 10_000_000]).
+    start_words: words already processed before this call (for resume).
+    Returns (checkpoint_paths, history) where checkpoint_paths includes both
+    per-epoch paths (phase_XX_epoch_YY) and milestone paths (chck_{N}).
+    history entries: {phase, epoch, loss, lr, words_processed}.
+    """
+    import json as _json
+
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    ckpt_dir = Path(output_dir) / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    model = model.to(device)
+    model.train()
+
+    grad_accum = max(1, config.effective_batch_size // config.per_device_batch_size)
+    pin = device == "cuda"
+
+    # ── Total optimizer steps across all phases (for LR scheduler) ───────────
+    total_steps = 0
+    phase_steps: list[int] = []
+    for jsonl_path, n_epochs in phases:
+        n_docs = sum(1 for l in Path(jsonl_path).read_text().splitlines() if l.strip())
+        steps = max(1, n_epochs * math.ceil(math.ceil(n_docs / config.per_device_batch_size) / grad_accum))
+        phase_steps.append(steps)
+        total_steps += steps
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        betas=config.adam_betas,
+        eps=config.adam_eps,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = get_scheduler(
+        config.lr_scheduler, optimizer=optimizer,
+        num_warmup_steps=0, num_training_steps=max(1, total_steps),
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=config.fp16)
+
+    # Fast-forward scheduler to resume point
+    completed_steps = 0
+    for p_idx in range(start_phase):
+        for _ in range(phase_steps[p_idx]):
+            scheduler.step()
+            completed_steps += 1
+    if start_phase < len(phases):
+        jsonl_path, _ = phases[start_phase]
+        n_docs_fp = sum(1 for l in Path(jsonl_path).read_text().splitlines() if l.strip())
+        steps_per_epoch_fp = max(1, math.ceil(math.ceil(n_docs_fp / config.per_device_batch_size) / grad_accum))
+        for _ in range(start_epoch * steps_per_epoch_fp):
+            scheduler.step()
+            completed_steps += 1
+
+    # Milestones still to hit (skip those already passed by start_words)
+    pending = sorted(m for m in word_checkpoints if m > start_words)
+
+    pbar = tqdm(total=total_steps, initial=completed_steps, desc="train", unit="step")
+
+    checkpoint_paths: list[str] = []
+    history: list[dict] = []
+    words_so_far = start_words
+
+    for p_idx, (jsonl_path, n_epochs) in enumerate(phases):
+        if p_idx < start_phase:
+            continue
+
+        lines = [l for l in Path(jsonl_path).read_text().splitlines() if l.strip()]
+        texts = [_json.loads(l)["text"] for l in lines]
+        word_counts = [len(t.split()) for t in texts]   # pre-computed per doc
+
+        batch_out = tokenizer(
+            texts,
+            truncation=True,
+            max_length=config.max_seq_len,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        dataset = TensorDataset(batch_out["input_ids"], batch_out["attention_mask"])
+        indices = list(range(len(dataset)))
+
+        epoch_start = start_epoch if p_idx == start_phase else 0
+
+        for epoch in range(epoch_start, n_epochs):
+            rng.shuffle(indices)
+            loader = DataLoader(
+                dataset,
+                batch_size=config.per_device_batch_size,
+                sampler=indices,
+                pin_memory=pin,
+            )
+            optimizer.zero_grad()
+            running_loss, accum_count = 0.0, 0
+            epoch_total_loss, epoch_total_count = 0.0, 0
+            B = config.per_device_batch_size
+
+            for step, (ids, mask) in enumerate(loader):
+                # Count words in this batch using original texts
+                batch_indices = indices[step * B : step * B + ids.shape[0]]
+                words_so_far += sum(word_counts[i] for i in batch_indices)
+
+                ids  = ids.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                labels = ids.clone()
+                labels[mask == 0] = -100
+                with torch.cuda.amp.autocast(enabled=config.fp16):
+                    outputs = model(input_ids=ids, attention_mask=mask, labels=labels)
+                scaler.scale(outputs.loss / grad_accum).backward()
+                running_loss  += outputs.loss.item()
+                accum_count   += 1
+                epoch_total_loss  += outputs.loss.item()
+                epoch_total_count += 1
+
+                if (step + 1) % grad_accum == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        phase=p_idx, epoch=epoch,
+                        words=f"{words_so_far:,}",
+                        loss=f"{running_loss/accum_count:.4f}",
+                        lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    )
+                    running_loss, accum_count = 0.0, 0
+
+                # Save milestone checkpoints as we cross word thresholds
+                while pending and words_so_far >= pending[0]:
+                    milestone = pending.pop(0)
+                    ckpt_name = (checkpoint_names or {}).get(milestone, f"chck_{milestone}")
+                    ckpt_path = str(ckpt_dir / ckpt_name)
+                    model.save_pretrained(ckpt_path)
+                    tokenizer.save_pretrained(ckpt_path)
+                    checkpoint_paths.append(ckpt_path)
+                    tqdm.write(f"  milestone {ckpt_name} at {words_so_far:,} words")
+                    if hub_repo:
+                        _push_revision(hub_repo, hub_token, ckpt_path, ckpt_name)
+
+            if len(loader) % grad_accum != 0:
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+                pbar.update(1)
+
+            epoch_loss = epoch_total_loss / epoch_total_count if epoch_total_count else float("nan")
+            current_lr = scheduler.get_last_lr()[0]
+            history.append({
+                "phase": p_idx,
+                "epoch": epoch,
+                "loss": epoch_loss,
+                "lr": current_lr,
+                "words_processed": words_so_far,
+            })
+
+            # Per-epoch checkpoint (folder on main, not a revision)
+            ckpt_name = f"phase_{p_idx:02d}_epoch_{epoch:02d}"
+            ckpt_path = str(ckpt_dir / ckpt_name)
+            model.save_pretrained(ckpt_path)
+            tokenizer.save_pretrained(ckpt_path)
+            checkpoint_paths.append(ckpt_path)
+            tqdm.write(f"phase {p_idx:02d} epoch {epoch:02d} done — {words_so_far:,} words  loss={epoch_loss:.4f}")
+
+            if hub_repo:
+                try:
+                    from huggingface_hub import HfApi
+                    HfApi().upload_folder(
+                        folder_path=ckpt_path,
+                        repo_id=hub_repo,
+                        path_in_repo=ckpt_name,
+                        repo_type="model",
+                        token=hub_token,
+                        commit_message=f"checkpoint {ckpt_name}  words={words_so_far:,}",
+                    )
+                except Exception as e:
+                    tqdm.write(f"  ⚠ Hub push failed: {e}")
+
+    pbar.close()
+    model.eval()
+    return checkpoint_paths, history
+
+
+def _push_revision(hub_repo: str, hub_token: str | None, local_path: str, revision: str) -> None:
+    """Push a checkpoint as a named git revision (branch) on the HF model repo."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        # Create the branch if it doesn't exist, then upload to it
+        try:
+            api.create_branch(repo_id=hub_repo, branch=revision,
+                              repo_type="model", token=hub_token)
+        except Exception:
+            pass  # branch already exists — fine, we'll overwrite
+        api.upload_folder(
+            folder_path=local_path,
+            repo_id=hub_repo,
+            path_in_repo=".",
+            repo_type="model",
+            revision=revision,
+            token=hub_token,
+            commit_message=f"milestone {revision}",
+        )
+        tqdm.write(f"  → pushed revision {revision} to {hub_repo}")
+    except Exception as e:
+        tqdm.write(f"  ⚠ Hub revision push failed ({revision}): {e}")

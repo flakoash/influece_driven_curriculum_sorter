@@ -87,7 +87,7 @@ def _build_cumulative(
 
     # aggregate across all checkpoints → one difficulty score per doc
     agg = Phi.mean(axis=1)
-    order = np.argsort(agg)  # ascending: easy → hard
+    order = np.argsort(agg)[::-1]  # descending: highest influence = easiest
 
     # split into G equal groups
     boundaries = [round(D * g / G) for g in range(G + 1)]
