@@ -370,7 +370,11 @@ def train_word_aware(
         if scheduled_remaining < remaining:
             extra = math.ceil((remaining - scheduled_remaining) / max(1, phase_words_per_epoch[-1]))
             effective_epochs = list(specified_epochs)
-            effective_epochs[-1] += extra
+            # If resuming mid-last-phase (start_epoch > specified), the loop starts at
+            # start_epoch, so effective_epochs[-1] must be start_epoch + extra, not
+            # specified[-1] + extra (which would give fewer actual epochs than needed).
+            last_epoch_start = start_epoch if start_phase == len(phases) - 1 else 0
+            effective_epochs[-1] = max(specified_epochs[-1], last_epoch_start) + extra
         else:
             effective_epochs = list(specified_epochs)
     else:

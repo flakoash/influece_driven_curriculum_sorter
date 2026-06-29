@@ -233,6 +233,37 @@ def test_train_word_aware_total_target_on_resume(tmp_path):
     assert len(history) >= 2, "expected ≥2 epochs from the resume point"
 
 
+def test_train_word_aware_total_target_resume_mid_extension(tmp_path):
+    """Extension is correct when resuming beyond the originally specified epochs.
+
+    Simulates: specified 1 epoch, already ran 3 epochs via extension (120 words).
+    Target = 200, start_words = 120, start_epoch = 3.
+    Remaining = 80 words → ceil(80/40) = 2 more epochs needed.
+    """
+    from influence_curriculum.train import train_word_aware
+
+    phase = tmp_path / "phase.jsonl"
+    _write_jsonl(phase, [FIVE_WORD_TEXT] * 8)  # 40 words/epoch
+
+    _, history = train_word_aware(
+        _tiny_model(), _tokenizer(),
+        phases=[(str(phase), 1)],
+        output_dir=str(tmp_path),
+        config=_cfg(),
+        seed=0, device="cpu",
+        word_checkpoints=[],
+        total_word_target=200,
+        start_words=120,
+        start_phase=0,
+        start_epoch=3,
+    )
+
+    assert history[-1]["words_processed"] >= 200, (
+        f"expected ≥200 words, got {history[-1]['words_processed']}"
+    )
+    assert len(history) >= 2, "expected ≥2 epochs from resume point"
+
+
 def test_train_word_aware_per_epoch_checkpoints_saved(tmp_path):
     """Per-epoch checkpoints (phase_XX_epoch_YY) are saved alongside milestones."""
     from influence_curriculum.train import train_word_aware
