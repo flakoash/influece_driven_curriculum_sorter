@@ -360,9 +360,15 @@ def train_word_aware(
     specified_epochs = [n for _, n in phases]
     if total_word_target is not None and total_word_target > start_words:
         remaining = total_word_target - start_words
-        total_scheduled = sum(wpe * ne for wpe, ne in zip(phase_words_per_epoch, specified_epochs))
-        if total_scheduled < remaining:
-            extra = math.ceil((remaining - total_scheduled) / max(1, phase_words_per_epoch[-1]))
+        # Count only words from epochs not yet completed at the resume point.
+        scheduled_remaining = 0
+        for p_idx, (wpe, ne) in enumerate(zip(phase_words_per_epoch, specified_epochs)):
+            if p_idx < start_phase:
+                continue
+            epoch_from = start_epoch if p_idx == start_phase else 0
+            scheduled_remaining += wpe * max(0, ne - epoch_from)
+        if scheduled_remaining < remaining:
+            extra = math.ceil((remaining - scheduled_remaining) / max(1, phase_words_per_epoch[-1]))
             effective_epochs = list(specified_epochs)
             effective_epochs[-1] += extra
         else:
