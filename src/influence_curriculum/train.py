@@ -319,12 +319,16 @@ def train_word_aware(
     start_words: int = 0,
     start_phase: int = 0,
     start_epoch: int = 0,
+    total_word_target: int | None = None,
 ) -> tuple[list[str], list[dict]]:
     """Train with per-epoch checkpoints + word-count milestone checkpoints.
 
     word_checkpoints: sorted list of cumulative word counts at which to save
         a revision checkpoint named chck_{N} (e.g. [1_000_000, ..., 10_000_000]).
     start_words: words already processed before this call (for resume).
+    total_word_target: if set, stop when this many cumulative words have been
+        processed. Extends the last phase with extra epochs if the scheduled
+        epochs don't reach the target; stops early if they overshoot it.
     Returns (checkpoint_paths, history) where checkpoint_paths includes both
     per-epoch paths (phase_XX_epoch_YY) and milestone paths (chck_{N}).
     history entries: {phase, epoch, loss, lr, words_processed}.
@@ -342,12 +346,35 @@ def train_word_aware(
     grad_accum = max(1, config.effective_batch_size // config.per_device_batch_size)
     pin = device == "cuda"
 
+    # ── Count words per phase epoch (needed for target estimation) ────────────
+    phase_words_per_epoch: list[int] = []
+    phase_doc_counts: list[int] = []
+    for jsonl_path, _ in phases:
+        lines = [l for l in Path(jsonl_path).read_text().splitlines() if l.strip()]
+        n_docs = len(lines)
+        total_words = sum(len(_json.loads(l)["text"].split()) for l in lines)
+        phase_words_per_epoch.append(total_words)
+        phase_doc_counts.append(n_docs)
+
+    # ── Compute effective epochs per phase ────────────────────────────────────
+    specified_epochs = [n for _, n in phases]
+    if total_word_target is not None and total_word_target > start_words:
+        remaining = total_word_target - start_words
+        total_scheduled = sum(wpe * ne for wpe, ne in zip(phase_words_per_epoch, specified_epochs))
+        if total_scheduled < remaining:
+            extra = math.ceil((remaining - total_scheduled) / max(1, phase_words_per_epoch[-1]))
+            effective_epochs = list(specified_epochs)
+            effective_epochs[-1] += extra
+        else:
+            effective_epochs = list(specified_epochs)
+    else:
+        effective_epochs = list(specified_epochs)
+
     # ── Total optimizer steps across all phases (for LR scheduler) ───────────
     total_steps = 0
     phase_steps: list[int] = []
-    for jsonl_path, n_epochs in phases:
-        n_docs = sum(1 for l in Path(jsonl_path).read_text().splitlines() if l.strip())
-        steps = max(1, n_epochs * math.ceil(math.ceil(n_docs / config.per_device_batch_size) / grad_accum))
+    for n_docs, n_eff in zip(phase_doc_counts, effective_epochs):
+        steps = max(1, n_eff * math.ceil(math.ceil(n_docs / config.per_device_batch_size) / grad_accum))
         phase_steps.append(steps)
         total_steps += steps
 
@@ -371,8 +398,7 @@ def train_word_aware(
             scheduler.step()
             completed_steps += 1
     if start_phase < len(phases):
-        jsonl_path, _ = phases[start_phase]
-        n_docs_fp = sum(1 for l in Path(jsonl_path).read_text().splitlines() if l.strip())
+        n_docs_fp = phase_doc_counts[start_phase]
         steps_per_epoch_fp = max(1, math.ceil(math.ceil(n_docs_fp / config.per_device_batch_size) / grad_accum))
         for _ in range(start_epoch * steps_per_epoch_fp):
             scheduler.step()
@@ -387,13 +413,13 @@ def train_word_aware(
     history: list[dict] = []
     words_so_far = start_words
 
-    for p_idx, (jsonl_path, n_epochs) in enumerate(phases):
+    for p_idx, (jsonl_path, _) in enumerate(phases):
         if p_idx < start_phase:
             continue
 
         lines = [l for l in Path(jsonl_path).read_text().splitlines() if l.strip()]
         texts = [_json.loads(l)["text"] for l in lines]
-        word_counts = [len(t.split()) for t in texts]   # pre-computed per doc
+        word_counts = [len(t.split()) for t in texts]
 
         batch_out = tokenizer(
             texts,
@@ -406,8 +432,12 @@ def train_word_aware(
         indices = list(range(len(dataset)))
 
         epoch_start = start_epoch if p_idx == start_phase else 0
+        n_eff = effective_epochs[p_idx]
 
-        for epoch in range(epoch_start, n_epochs):
+        for epoch in range(epoch_start, n_eff):
+            if total_word_target is not None and words_so_far >= total_word_target:
+                break
+
             rng.shuffle(indices)
             loader = DataLoader(
                 dataset,
@@ -501,6 +531,9 @@ def train_word_aware(
                     )
                 except Exception as e:
                     tqdm.write(f"  ⚠ Hub push failed: {e}")
+
+        if total_word_target is not None and words_so_far >= total_word_target:
+            break
 
     pbar.close()
     model.eval()

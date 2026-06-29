@@ -149,6 +149,56 @@ def test_train_word_aware_skips_milestones_before_start_words(tmp_path):
     assert "chck_40" in names, f"chck_40 should still be saved"
 
 
+def test_train_word_aware_stops_at_total_word_target(tmp_path):
+    """Training stops once total_word_target is reached, even if n_epochs would run longer."""
+    from influence_curriculum.train import train_word_aware
+
+    phase = tmp_path / "phase.jsonl"
+    _write_jsonl(phase, [FIVE_WORD_TEXT] * 8)  # 40 words/epoch
+
+    # 3 specified epochs = 120 words; target = 60 → should stop after 2 epochs
+    _, history = train_word_aware(
+        _tiny_model(), _tokenizer(),
+        phases=[(str(phase), 3)],
+        output_dir=str(tmp_path),
+        config=_cfg(),
+        seed=0, device="cpu",
+        word_checkpoints=[],
+        total_word_target=60,
+    )
+
+    assert len(history) == 2, (
+        f"expected 2 epochs (target=60 words, 40 words/epoch), got {len(history)}"
+    )
+    assert history[-1]["words_processed"] >= 60
+
+
+def test_train_word_aware_extends_last_phase_to_reach_target(tmp_path):
+    """When specified epochs fall short, last phase is extended to reach total_word_target."""
+    from influence_curriculum.train import train_word_aware
+
+    phase = tmp_path / "phase.jsonl"
+    _write_jsonl(phase, [FIVE_WORD_TEXT] * 8)  # 40 words/epoch
+
+    # 1 specified epoch = 40 words; target = 100 → needs 3 epochs to reach 100
+    _, history = train_word_aware(
+        _tiny_model(), _tokenizer(),
+        phases=[(str(phase), 1)],
+        output_dir=str(tmp_path),
+        config=_cfg(),
+        seed=0, device="cpu",
+        word_checkpoints=[],
+        total_word_target=100,
+    )
+
+    assert history[-1]["words_processed"] >= 100, (
+        f"expected ≥100 words, got {history[-1]['words_processed']}"
+    )
+    assert len(history) >= 3, (
+        f"expected ≥3 epochs to reach 100 words at 40 words/epoch, got {len(history)}"
+    )
+
+
 def test_train_word_aware_per_epoch_checkpoints_saved(tmp_path):
     """Per-epoch checkpoints (phase_XX_epoch_YY) are saved alongside milestones."""
     from influence_curriculum.train import train_word_aware
