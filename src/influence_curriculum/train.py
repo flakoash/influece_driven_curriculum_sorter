@@ -498,6 +498,7 @@ def train_word_aware(
                     ckpt_path = str(ckpt_dir / ckpt_name)
                     model.save_pretrained(ckpt_path)
                     tokenizer.save_pretrained(ckpt_path)
+                    _fix_tokenizer_config(ckpt_path)
                     checkpoint_paths.append(ckpt_path)
                     tqdm.write(f"  milestone {ckpt_name} at {words_so_far:,} words")
                     if hub_repo:
@@ -525,6 +526,7 @@ def train_word_aware(
             ckpt_path = str(ckpt_dir / ckpt_name)
             model.save_pretrained(ckpt_path)
             tokenizer.save_pretrained(ckpt_path)
+            _fix_tokenizer_config(ckpt_path)
             checkpoint_paths.append(ckpt_path)
             tqdm.write(f"phase {p_idx:02d} epoch {epoch:02d} done — {words_so_far:,} words  loss={epoch_loss:.4f}")
 
@@ -548,6 +550,26 @@ def train_word_aware(
     pbar.close()
     model.eval()
     return checkpoint_paths, history
+
+
+def _fix_tokenizer_config(checkpoint_path: str) -> None:
+    """Patch tokenizer_config.json to use a standard HF tokenizer class.
+
+    Some tokenizer wrappers (e.g. TokenizersBackend) save a non-standard
+    tokenizer_class that AutoProcessor cannot resolve. Normalise it to
+    PreTrainedTokenizerFast so the competition eval pipeline works.
+    """
+    import json as _json
+    cfg_path = Path(checkpoint_path) / "tokenizer_config.json"
+    if not cfg_path.exists():
+        return
+    cfg = _json.loads(cfg_path.read_text())
+    standard = {"PreTrainedTokenizerFast", "GPT2Tokenizer", "GPT2TokenizerFast", None}
+    if cfg.get("tokenizer_class") not in standard:
+        cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+    for k in ("backend", "is_local", "local_files_only"):
+        cfg.pop(k, None)
+    cfg_path.write_text(_json.dumps(cfg, indent=2))
 
 
 def _push_revision(hub_repo: str, hub_token: str | None, local_path: str, revision: str) -> None:
