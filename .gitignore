@@ -10,3 +10,17 @@ build/
 *.npy
 .DS_Store
 datasets/
+docs/influence_oom_analysis.md
+docs/superpowers/plans/2026-06-19-pass2-jvp-fix.md
+notebooks/outputs/sequential_bands/_texts.jsonl
+notebooks/outputs/sequential_bands/band_distribution.png
+notebooks/outputs/sequential_bands/doc_ids.json
+notebooks/outputs/sequential_bands/curriculum/epoch_00.jsonl
+notebooks/outputs/sequential_bands/curriculum/epoch_00.txt
+notebooks/outputs/sequential_bands/curriculum/epoch_01.jsonl
+notebooks/outputs/sequential_bands/curriculum/epoch_01.txt
+notebooks/outputs/sequential_bands/curriculum/epoch_02.jsonl
+notebooks/outputs/sequential_bands/curriculum/epoch_02.txt
+notebooks/outputs/sequential_bands/curriculum/epoch_03.jsonl
+notebooks/outputs/sequential_bands/curriculum/epoch_03.txt
+.claude/settings.local.json
